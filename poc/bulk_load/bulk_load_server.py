@@ -303,7 +303,8 @@ def _make_main_insert_query(tenant, table_info,
 
 
 def _make_index_update_query(tenant, table_info, attr_map, indexed_attr):
-    pass
+    query_builder = [
+        'UPDATE "{}"."{}" SET'.format(tenant, table_info.internal_name)]
 
 
 def _make_insert_query(tenant, table_info, attr_map):
@@ -318,11 +319,11 @@ def _make_insert_query(tenant, table_info, attr_map):
         _make_main_insert_query(tenant, table_info, attr_map, indexed) + ';')
 
     if indexed:
-        # for _, index_def in table_info.schema.index_def_map.iteritems():
-        #     query_builder.append(
-        #         _make_index_update_query(
-        #             tenant, table_info, attr_map,
-        #             index_def.attribute_to_index) + ';')
+        for _, index_def in table_info.schema.index_def_map.iteritems():
+            query_builder.append(
+                _make_index_update_query(
+                    tenant, table_info, attr_map,
+                    index_def.attribute_to_index) + ';')
 
         query_builder.append('APPLY BATCH')
 
@@ -387,14 +388,13 @@ def _are_attrs_changed(old_attrs, new_attrs):
     return True
 
 
-def _cb_read(result, futures, tenant, table_info, attr_map):
-    table_name = table_info.internal_name
-    LOG.debug("Read table '{}.{}' : {}".format(
-        tenant, table_name, result))
+def _cb_read(result, futures, count, read_query, insert_query):
+    LOG.debug("Read table {} : result {}".format(
+        read_query, result))
     if not result:
-        query = _make_insert_query(tenant, table_info, attr_map)
-        LOG.debug("Inserting new item {} into '{}.{}': {}".format(
-            attr_map, tenant, table_name, query))
+        LOG.debug("Inserting new item {}".format(
+            insert_query))
+        query = insert_query
     else:
         old_attrs = _parse_index_values(table_info, result)
 
@@ -408,32 +408,37 @@ def _cb_read(result, futures, tenant, table_info, attr_map):
                 attr_map, tenant, table_name, query))
 
     future = STORAGE.session.execute_async(query)
-    future.add_callback(_cb_insert, futures, tenant, table_info, attr_map)
+    future.add_callback(_cb_insert, futures, count, read_query, insert_query)
     futures.put_nowait(future)
+    count[0] += 1
 
 
-def _cb_insert(result, futures, tenant, table_info, attr_map):
-    LOG.debug("Insert {} into {}.{} result {}".format(
-        attr_map, tenant, table_info.internal_name, result))
+def _cb_insert(result, futures, count, read_query, insert_query):
+    LOG.debug("Insert {} result {}".format(
+        insert_query, result))
     if not _is_applied(result):
-        put_item_async(futures, tenant, table_info, attr_map)
+        _read_table(futures, count, read_query, insert_query)
 
 
-def put_item_async(futures, tenant, table_info, attr_map):
-    query = _make_read_query(tenant, table_info, attr_map)
-    LOG.debug("Reading table '{}.{}' ".format(
-        tenant, table_info.internal_name))
-    future = STORAGE.session.execute_async(
-        query)
-    future.add_callback(_cb_read, futures, tenant, table_info, attr_map)
+def put_item_async(futures, count, tenant, table_info, attr_map):
+    read_query = _make_read_query(tenant, table_info, attr_map)
+    insert_query = _make_insert_query(tenant, table_info, attr_map)
+    _read_table(futures, count, read_query, insert_query)
+
+
+def _read_table(futures, count, read_query, insert_query):
+    LOG.debug("Reading table: ".format(read_query))
+    future = STORAGE.session.execute_async(read_query)
+    future.add_callback(_cb_read, futures, count, read_query, insert_query)
     futures.put_nowait(future)
+    count[0] += 1
 
 
 def put_item_app(environ, start_response):
     queue_size = 1000
     max_count = 100
     futures = Queue.Queue(maxsize=queue_size + 1)
-    count = 0
+    count = [0, 0]
 
     print 'Request'
 
@@ -444,26 +449,25 @@ def put_item_app(environ, start_response):
         for chunk in stream:
             data = json.loads(chunk)
 
-            if count % 10000 == 0:
-                print count
+            if count[0] % 1000 == 0:
+                print count[0]
 
-            count += 1
-
-            if count >= max_count:
+            while count[0] - count[1] >= max_count:
                 try:
                     old_future = futures.get_nowait()
+                    count[1] += 1
                     old_future.result()
                 except Exception as e:
-                    print str(e)
+                    print 'Ex1' + str(e)
 
             try:
                 attr_map = _json_to_attribute_map(data)
-                put_item_async(futures, TENANT, table_info, attr_map)
+                put_item_async(futures, count, TENANT, table_info, attr_map)
             except Exception as e:
-                print 'Ex1' + str(e)
+                print 'Ex2' + str(e)
 
     except Exception as e:
-        print 'Ex2' + str(e)
+        print 'Ex3' + str(e)
 
     while not futures.empty():
         f = futures.get_nowait()
