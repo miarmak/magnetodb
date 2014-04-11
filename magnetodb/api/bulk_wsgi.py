@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 import base64
 import binascii
 from gevent import pywsgi
@@ -306,6 +304,8 @@ def _make_index_update_query(tenant, table_info, attr_map, indexed_attr):
     query_builder = [
         'UPDATE "{}"."{}" SET'.format(tenant, table_info.internal_name)]
 
+    return ' '.join(query_builder)
+
 
 def _make_insert_query(tenant, table_info, attr_map):
     query_builder = []
@@ -319,11 +319,11 @@ def _make_insert_query(tenant, table_info, attr_map):
         _make_main_insert_query(tenant, table_info, attr_map, indexed) + ';')
 
     if indexed:
-        for _, index_def in table_info.schema.index_def_map.iteritems():
-            query_builder.append(
-                _make_index_update_query(
-                    tenant, table_info, attr_map,
-                    index_def.attribute_to_index) + ';')
+    #     for _, index_def in table_info.schema.index_def_map.iteritems():
+    #         query_builder.append(
+    #             _make_index_update_query(
+    #                 tenant, table_info, attr_map,
+    #                 index_def.attribute_to_index) + ';')
 
         query_builder.append('APPLY BATCH')
 
@@ -421,20 +421,36 @@ def _cb_insert(result, futures, count, read_query, insert_query):
 
 
 def put_item_async(futures, count, tenant, table_info, attr_map):
-    read_query = _make_read_query(tenant, table_info, attr_map)
     insert_query = _make_insert_query(tenant, table_info, attr_map)
-    _read_table(futures, count, read_query, insert_query)
+
+    if table_info.schema.index_def_map:
+        read_query = _make_read_query(tenant, table_info, attr_map)
+        _read_table(futures, count, read_query, insert_query)
+    else:
+        _insert(futures, count, insert_query)
 
 
 def _read_table(futures, count, read_query, insert_query):
-    LOG.debug("Reading table: ".format(read_query))
+    LOG.debug("Reading table:{}".format(read_query))
     future = STORAGE.session.execute_async(read_query)
     future.add_callback(_cb_read, futures, count, read_query, insert_query)
     futures.put_nowait(future)
     count[0] += 1
 
 
-def put_item_app(environ, start_response):
+def _insert(futures, count, insert_query):
+    LOG.debug("Inserting item:{} ".format(insert_query))
+    future = STORAGE.session.execute_async(insert_query)
+    futures.put_nowait(future)
+    count[0] += 1
+
+
+def app_factory(global_conf, **local_conf):
+    return bulk_load_app
+
+
+def bulk_load_app(environ, start_response):
+    init_test_env()
     queue_size = 1000
     max_count = 100
     futures = Queue.Queue(maxsize=queue_size + 1)
@@ -476,10 +492,3 @@ def put_item_app(environ, start_response):
 
     start_response('200 OK', [('Content-Type', 'text/html')])
     yield 'Done\n'
-
-if __name__ == '__main__':
-    init_test_env()
-
-    server = pywsgi.WSGIServer(('localhost', 9999), put_item_app)
-
-    server.serve_forever()
